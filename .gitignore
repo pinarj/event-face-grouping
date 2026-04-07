@@ -1,0 +1,32 @@
+venv/
+data/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.env
+
+# Binar data - large files
+binar/**/*.npy
+binar/**/*.jpg
+binar/**/*.jpeg
+binar/**/*.png
+binar/**/*.JPG
+binar/**/*.JPEG
+binar/**/*.PNG
+binar/**/*_meta.json
+binar/**/clothing_index.json
+binar/**/groups.json
+binar/**/refined_groups.json
+binar/bib2and4_embeddings/
+binar/bib2and4_clothing/
+binar/bib2and4_groups/
+binar/bib2and4_refined/
+binar/embeddings/
+binar/faiss_index/
+
+# Keep test reports
+!binar/**/TEST_RAPORU.md

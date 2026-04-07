@@ -1,0 +1,8 @@
+numpy
+opencv-python
+insightface
+onnxruntime
+scikit-learn
+scikit-image
+pillow
+psutil
