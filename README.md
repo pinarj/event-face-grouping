@@ -1,6 +1,6 @@
-# Face Grouping Pipeline — Production Scripts
+# Face Grouping & Clothing Analysis Pipeline
 
-Clusters all faces from a race event into person-based groups, then merges those groups with bib number detections to produce a final `bib_groups.json` per person.
+Clusters all faces from a race event into person-based groups using ArcFace embeddings, FAISS-based clustering, and dual-layer clothing analysis. Outputs `refined_groups.json` per event.
 
 ---
 
