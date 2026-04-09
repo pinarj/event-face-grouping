@@ -167,7 +167,7 @@ To get the photo filename and bounding box, read the `_meta.json` file:
 embeddings/FAJ_2847_0_meta.json → {"original_filename": "FAJ_2847.jpg", "bbox": [x1, y1, x2, y2]}
 ```
 
-The `bbox` tells Brian's OCR exactly where on the photo the face is, so it can focus on the nearest bib rather than reading all visible bibs.
+The `bbox` tells the OCR engine exactly where on the photo the face is, so it can focus on the nearest bib rather than reading all visible bibs.
 
 ---
 
