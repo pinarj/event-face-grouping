@@ -25,6 +25,7 @@ logger = logging.getLogger("clothing_extractor")
 def _emit_json_and_exit(data, code=0):
     # write JSON result to stdout so the caller (PHP) can parse it cleanly
     sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
+    sys.stdout.write("done\n")
     sys.stdout.flush()
     sys.exit(code)
 
@@ -107,18 +108,23 @@ def load_embeddings_index(embeddings_dir):
     return entries
 
 
-def find_photo(photos_dir, filename):
-    # search recursively — photos may be in subdirectories (e.g. by date or category)
-    matches = glob.glob(os.path.join(photos_dir, "**", filename), recursive=True)
-    return matches[0] if matches else None
+def build_photo_lookup(photos_dir):
+    # scan photos_dir once and build {filename: full_path} — called once in main
+    # avoids recursive glob per photo (250k photos × glob = millions of disk ops)
+    lookup = {}
+    for root, _, files in os.walk(photos_dir):
+        for f in files:
+            lookup[f] = os.path.join(root, f)
+    logger.info(f"Photo lookup built: {len(lookup)} files in {photos_dir}")
+    return lookup
 
 
 def process_photo(args_tuple):
     # worker function — processes all faces from a single photo
     # called in a separate process via ProcessPoolExecutor
-    photos_dir, filename, photo_entries, save_crops, crops_dir = args_tuple
+    photo_lookup, filename, photo_entries, save_crops, crops_dir = args_tuple
 
-    photo_path = find_photo(photos_dir, filename)
+    photo_path = photo_lookup.get(filename)
     if not photo_path:
         return [], [], len(photo_entries)
 
@@ -188,8 +194,9 @@ def main():
             photo_to_entries[filename].append((npy_path, face_id, bbox))
 
         crops_dir = os.path.join(args.output, "crops") if args.save_crops else None
+        photo_lookup = build_photo_lookup(args.photos)
         tasks = [
-            (args.photos, filename, photo_entries, args.save_crops, crops_dir)
+            (photo_lookup, filename, photo_entries, args.save_crops, crops_dir)
             for filename, photo_entries in photo_to_entries.items()
         ]
 

@@ -19,7 +19,6 @@ import json
 import logging
 import argparse
 import numpy as np
-from collections import defaultdict
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -29,6 +28,7 @@ logger = logging.getLogger("refine_groups")
 def _emit_json_and_exit(data, code=0):
     # write JSON result to stdout so the caller (PHP) can parse it cleanly
     sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
+    sys.stdout.write("done\n")
     sys.stdout.flush()
     sys.exit(code)
 
@@ -199,20 +199,31 @@ def should_merge(face_ids_a, face_ids_b, upper, lower, embeddings,
 
 
 def merge_all_groups(groups, upper, lower, embeddings, clothing_threshold=0.6, lower_veto_threshold=0.5, max_group_size=5):
-    # iteratively merge groups until no new merges are found
-    # Union-Find (path-compressed) efficiently tracks which groups have already been merged
+    # Union-Find with an explicit root→members index.
+    # Old approach: inner O(n_groups) scan to collect members per root → O(n_groups³) total.
+    # New approach: maintain root_members dict, update on every union → O(n_groups²) total.
     group_keys = list(groups.keys())
     parent = {k: k for k in group_keys}
 
     def find(x):
-        # path compression — flattens the tree for O(α) amortized lookup
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
+    # root_members[root] = combined face_id list for that cluster
+    root_members = {k: list(groups[k]) for k in group_keys}
+
     def union(x, y):
-        parent[find(x)] = find(y)
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return
+        # merge smaller into larger to keep root_members balanced
+        if len(root_members[rx]) < len(root_members[ry]):
+            rx, ry = ry, rx
+        parent[ry] = rx
+        # O(members) merge — no full group scan needed
+        root_members[rx].extend(root_members.pop(ry))
 
     merge_count = 0
     for i in range(len(group_keys)):
@@ -220,16 +231,10 @@ def merge_all_groups(groups, upper, lower, embeddings, clothing_threshold=0.6, l
             ka, kb = group_keys[i], group_keys[j]
             root_a, root_b = find(ka), find(kb)
             if root_a == root_b:
-                continue  # already in the same merged group
+                continue
 
-            # collect all face_ids belonging to each root (may span multiple original groups)
-            members_a = []
-            members_b = []
-            for k in group_keys:
-                if find(k) == root_a:
-                    members_a.extend(groups[k])
-                elif find(k) == root_b:
-                    members_b.extend(groups[k])
+            members_a = root_members[root_a]
+            members_b = root_members[root_b]
 
             do_merge, sim = should_merge(
                 members_a, members_b, upper, lower, embeddings,
@@ -241,16 +246,8 @@ def merge_all_groups(groups, upper, lower, embeddings, clothing_threshold=0.6, l
                 union(root_a, root_b)
                 merge_count += 1
 
-    # rebuild the final group dict from union-find roots
-    merged = defaultdict(list)
-    for k in group_keys:
-        root = find(k)
-        for fn in groups[k]:
-            if fn not in merged[root]:
-                merged[root].append(fn)
-
-    logger.info(f"Merged {merge_count} group pairs -> {len(merged)} groups")
-    return dict(merged)
+    logger.info(f"Merged {merge_count} group pairs -> {len(root_members)} groups")
+    return dict(root_members)
 
 
 def main():
