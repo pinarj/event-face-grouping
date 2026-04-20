@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-assign_bib_production.py — Assign bib numbers to face groups using QR/DataMatrix results.
+assign_bib.py — Assign bib numbers to face groups using QR/DataMatrix results.
 Optionally runs FAISS search to include candidate photos (pass_threshold: false).
 
 Logging: stderr only
 Output:  stdout — single JSON line on success
 
-Usage (QR + spatial check — recommended):
-    python assign_bib_production.py --groups refined_groups.json --qr qr.json \
+Usage :
+    python assign_bib.py --groups refined_groups.json --qr qr.json \
         --output output/ --embeddings embeddings/
 
     --embeddings is required for spatial face↔bib matching.
     Without it, all faces in a multi-face photo receive the same bib vote
     regardless of position, which can cause wrong bib assignments.
 
-Usage (QR + spatial check + FAISS candidates):
-    python assign_bib_production.py --groups refined_groups.json --qr qr.json \
-        --output output/ --embeddings embeddings/ --faiss-dir faiss/
 """
 
 
