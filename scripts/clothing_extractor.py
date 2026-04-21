@@ -14,7 +14,7 @@ import numpy as np
 import cv2
 from datetime import datetime
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from skimage.feature import local_binary_pattern
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
@@ -120,11 +120,8 @@ def build_photo_lookup(photos_dir):
 
 
 def process_photo(args_tuple):
-    # worker function — processes all faces from a single photo
-    # called in a separate process via ProcessPoolExecutor
-    photo_lookup, filename, photo_entries, save_crops, crops_dir = args_tuple
+    photo_path, filename, photo_entries, save_crops, crops_dir = args_tuple
 
-    photo_path = photo_lookup.get(filename)
     if not photo_path:
         return [], [], len(photo_entries)
 
@@ -196,12 +193,12 @@ def main():
         crops_dir = os.path.join(args.output, "crops") if args.save_crops else None
         photo_lookup = build_photo_lookup(args.photos)
         tasks = [
-            (photo_lookup, filename, photo_entries, args.save_crops, crops_dir)
+            (photo_lookup.get(filename), filename, photo_entries, args.save_crops, crops_dir)
             for filename, photo_entries in photo_to_entries.items()
         ]
 
         logger.info(f"Processing with {args.workers} workers...")
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = {executor.submit(process_photo, task): task for task in tasks}
             done = 0
             for future in as_completed(futures):
