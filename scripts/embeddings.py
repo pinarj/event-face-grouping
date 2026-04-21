@@ -7,7 +7,9 @@
 
 # must be set before importing anything that uses multiprocessing
 import multiprocessing
-multiprocessing.set_start_method("fork", force=True)
+import platform
+_start_method = "fork" if platform.system() != "Windows" else "spawn"
+multiprocessing.set_start_method(_start_method, force=True)
 
 # limit internal threadpools before importing numpy/onnx/cv2
 import os
@@ -74,23 +76,11 @@ def parse_arguments():
                         help="Number of parallel processes (default: auto)")
     parser.add_argument("--batch-size", "-b", type=int, default=None,
                         help="Submit window size (default: 2 x workers)")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Use GPU (CUDA) for inference — requires onnxruntime-gpu")
     return parser.parse_args()
 
 
-args = parse_arguments()
-INPUT_FOLDER = args.input
-OUTPUT_FOLDER = args.output
-
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-# worker count — capped by both CPU count and available RAM (~2 GB per worker)
-cpu_count = os.cpu_count() or 1
-total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
-max_by_ram = max(1, int(total_ram_gb // 2))
-auto_workers = min(cpu_count, max_by_ram)
-
-MAX_WORKERS = max(1, args.max_workers if args.max_workers else auto_workers)
-BATCH_SIZE = max(1, args.batch_size if args.batch_size else MAX_WORKERS * 2)
 
 
 # image helpers
@@ -179,15 +169,16 @@ def apply_exif_orientation(image_path):
             return None
 
 
-# load model once in parent process — all workers inherit it via fork (zero copy)
 from insightface.app import FaceAnalysis
 
-APP_SHARED = FaceAnalysis(name="buffalo_l")
-APP_SHARED.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.7)
+# fork: model loaded once in parent before workers spawn, inherited via copy-on-write
+# spawn (Windows): model loaded per worker in _init_worker
+_IS_FORK = (platform.system() != "Windows")
+APP_SHARED = None
 
 
-def _init_worker():
-    # workers inherit the model from the parent via fork, no re-loading needed
+def _init_worker(ctx_id=-1):
+    global APP_SHARED
     import warnings as _w
     _w.filterwarnings("ignore", category=FutureWarning)
     _w.filterwarnings(
@@ -196,6 +187,9 @@ def _init_worker():
         category=UserWarning,
         module="onnxruntime"
     )
+    if APP_SHARED is None:
+        APP_SHARED = FaceAnalysis(name="buffalo_l")
+        APP_SHARED.prepare(ctx_id=ctx_id, det_size=(640, 640), det_thresh=0.7)
 
 
 def _process_image_worker(input_folder, filename):
@@ -279,134 +273,162 @@ def chunks(seq, n):
         yield seq[i:i + n]
 
 
-started_at = datetime.now()
-t0 = time.time()
-logger.info(f"START embeddings started_at={started_at.isoformat(timespec='seconds')}")
+def main():
+    args = parse_arguments()
+    INPUT_FOLDER = args.input
+    OUTPUT_FOLDER = args.output
 
-failed_files = []
-processed = 0
-skipped = 0
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# collect image list
-try:
-    image_files = [
-        f for f in os.listdir(INPUT_FOLDER)
-        if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"))
-    ]
-except FileNotFoundError:
-    logger.error(f"Input folder not found: {INPUT_FOLDER}")
+    # worker count — capped by both CPU count and available RAM (~2 GB per worker)
+    cpu_count = os.cpu_count() or 1
+    total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    max_by_ram = max(1, int(total_ram_gb // 2))
+    auto_workers = min(cpu_count, max_by_ram)
+
+    MAX_WORKERS = max(1, args.max_workers if args.max_workers else auto_workers)
+    BATCH_SIZE = max(1, args.batch_size if args.batch_size else MAX_WORKERS * 2)
+
+    ctx_id = 0 if args.gpu else -1
+    device_label = f"GPU (ctx_id={ctx_id})" if args.gpu else "CPU"
+
+    if _IS_FORK:
+        global APP_SHARED
+        APP_SHARED = FaceAnalysis(name="buffalo_l")
+        APP_SHARED.prepare(ctx_id=ctx_id, det_size=(640, 640), det_thresh=0.7)
+
+    started_at = datetime.now()
+    t0 = time.time()
+    logger.info(f"START embeddings started_at={started_at.isoformat(timespec='seconds')} device={device_label}")
+
+    failed_files = []
+    processed = 0
+    skipped = 0
+
+    # collect image list
+    try:
+        image_files = [
+            f for f in os.listdir(INPUT_FOLDER)
+            if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"))
+        ]
+    except FileNotFoundError:
+        logger.error(f"Input folder not found: {INPUT_FOLDER}")
+        finished_at = datetime.now()
+        duration_s = round(time.time() - t0, 3)
+        logger.info(
+            "END embeddings finished_at=%s duration_s=%.3f status=%s processed=%d failed=%d",
+            finished_at.isoformat(timespec="seconds"),
+            duration_s,
+            "error",
+            0,
+            0
+        )
+        _emit_json_and_exit({
+            "status": "error",
+            "total_images": 0,
+            "submitted": 0,
+            "skipped_existing": 0,
+            "processed": 0,
+            "failed": 0,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": duration_s,
+            "error_message": f"Input folder not found: {INPUT_FOLDER}",
+        }, 1)
+
+    if not image_files:
+        logger.error(f"No image files found in '{INPUT_FOLDER}'")
+        finished_at = datetime.now()
+        duration_s = round(time.time() - t0, 3)
+        logger.info(
+            "END embeddings finished_at=%s duration_s=%.3f status=%s processed=%d failed=%d",
+            finished_at.isoformat(timespec="seconds"),
+            duration_s,
+            "error",
+            0,
+            0
+        )
+        _emit_json_and_exit({
+            "status": "error",
+            "total_images": 0,
+            "submitted": 0,
+            "skipped_existing": 0,
+            "processed": 0,
+            "failed": 0,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": duration_s,
+            "error_message": f"No image files found in '{INPUT_FOLDER}'",
+        }, 1)
+
+    # skip already processed files unless --force
+    submit_list = []
+    if not args.force:
+        for fname in image_files:
+            base = os.path.splitext(fname)[0]
+            if already_processed(OUTPUT_FOLDER, base):
+                skipped += 1
+                continue
+            submit_list.append(fname)
+    else:
+        submit_list = image_files
+
+    # run
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker, initargs=(ctx_id,)) as executor:
+        total_to_process = len(submit_list)
+        processed_count = 0
+        for chunk in chunks(submit_list, BATCH_SIZE):
+            futures = {executor.submit(_process_image_worker, INPUT_FOLDER, fname): fname for fname in chunk}
+            for future in as_completed(futures):
+                filename, embeddings, error = future.result()
+                base_filename = os.path.splitext(filename)[0]
+
+                if error:
+                    logger.error(error)
+                    failed_files.append((filename, error))
+                else:
+                    if embeddings:
+                        for face_idx, embedding, bbox in embeddings:
+                            # each face gets its own .npy file and a meta.json with original filename + bbox
+                            unique_face_id = f"{base_filename}_{face_idx}"
+                            np.save(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}.npy"), embedding)
+                            with open(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}_meta.json"), "w", encoding="utf-8") as meta_file:
+                                json.dump({"original_filename": filename, "bbox": bbox}, meta_file, ensure_ascii=False)
+
+                processed += 1
+                processed_count += 1
+                if processed_count % 500 == 0 or processed_count == total_to_process:
+                    logger.info(f"Progress: {processed_count}/{total_to_process} images processed")
+
+    # summary
     finished_at = datetime.now()
     duration_s = round(time.time() - t0, 3)
+
+    status = "error" if processed == 0 else ("partial" if len(failed_files) > 0 else "success")
+
+    summary = {
+        "status": status,
+        "total_images": len(image_files),
+        "submitted": len(submit_list),
+        "skipped_existing": skipped,
+        "processed": processed,
+        "failed": len(failed_files),
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": finished_at.isoformat(timespec="seconds"),
+        "duration_seconds": duration_s,
+    }
+
     logger.info(
         "END embeddings finished_at=%s duration_s=%.3f status=%s processed=%d failed=%d",
         finished_at.isoformat(timespec="seconds"),
         duration_s,
-        "error",
-        0,
-        0
+        summary["status"],
+        summary["processed"],
+        summary["failed"]
     )
-    _emit_json_and_exit({
-        "status": "error",
-        "total_images": 0,
-        "submitted": 0,
-        "skipped_existing": 0,
-        "processed": 0,
-        "failed": 0,
-        "started_at": started_at.isoformat(timespec="seconds"),
-        "finished_at": finished_at.isoformat(timespec="seconds"),
-        "duration_seconds": duration_s,
-        "error_message": f"Input folder not found: {INPUT_FOLDER}",
-    }, 1)
 
-if not image_files:
-    logger.error(f"No image files found in '{INPUT_FOLDER}'")
-    finished_at = datetime.now()
-    duration_s = round(time.time() - t0, 3)
-    logger.info(
-        "END embeddings finished_at=%s duration_s=%.3f status=%s processed=%d failed=%d",
-        finished_at.isoformat(timespec="seconds"),
-        duration_s,
-        "error",
-        0,
-        0
-    )
-    _emit_json_and_exit({
-        "status": "error",
-        "total_images": 0,
-        "submitted": 0,
-        "skipped_existing": 0,
-        "processed": 0,
-        "failed": 0,
-        "started_at": started_at.isoformat(timespec="seconds"),
-        "finished_at": finished_at.isoformat(timespec="seconds"),
-        "duration_seconds": duration_s,
-        "error_message": f"No image files found in '{INPUT_FOLDER}'",
-    }, 1)
+    _emit_json_and_exit(summary, 0 if status != "error" else 1)
 
-# skip already processed files unless --force
-submit_list = []
-if not args.force:
-    for fname in image_files:
-        base = os.path.splitext(fname)[0]
-        if already_processed(OUTPUT_FOLDER, base):
-            skipped += 1
-            continue
-        submit_list.append(fname)
-else:
-    submit_list = image_files
 
-# run
-with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker) as executor:
-    total_to_process = len(submit_list)
-    processed_count = 0
-    for chunk in chunks(submit_list, BATCH_SIZE):
-        futures = {executor.submit(_process_image_worker, INPUT_FOLDER, fname): fname for fname in chunk}
-        for future in as_completed(futures):
-            filename, embeddings, error = future.result()
-            base_filename = os.path.splitext(filename)[0]
-
-            if error:
-                logger.error(error)
-                failed_files.append((filename, error))
-            else:
-                if embeddings:
-                    for face_idx, embedding, bbox in embeddings:
-                        # each face gets its own .npy file and a meta.json with original filename + bbox
-                        unique_face_id = f"{base_filename}_{face_idx}"
-                        np.save(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}.npy"), embedding)
-                        with open(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}_meta.json"), "w", encoding="utf-8") as meta_file:
-                            json.dump({"original_filename": filename, "bbox": bbox}, meta_file, ensure_ascii=False)
-
-            processed += 1
-            processed_count += 1
-            if processed_count % 500 == 0 or processed_count == total_to_process:
-                logger.info(f"Progress: {processed_count}/{total_to_process} images processed")
-
-# summary
-finished_at = datetime.now()
-duration_s = round(time.time() - t0, 3)
-
-status = "error" if processed == 0 else ("partial" if len(failed_files) > 0 else "success")
-
-summary = {
-    "status": status,
-    "total_images": len(image_files),
-    "submitted": len(submit_list),
-    "skipped_existing": skipped,
-    "processed": processed,
-    "failed": len(failed_files),
-    "started_at": started_at.isoformat(timespec="seconds"),
-    "finished_at": finished_at.isoformat(timespec="seconds"),
-    "duration_seconds": duration_s,
-}
-
-logger.info(
-    "END embeddings finished_at=%s duration_s=%.3f status=%s processed=%d failed=%d",
-    finished_at.isoformat(timespec="seconds"),
-    duration_s,
-    summary["status"],
-    summary["processed"],
-    summary["failed"]
-)
-
-_emit_json_and_exit(summary, 0 if status != "error" else 1)
+if __name__ == "__main__":
+    main()
