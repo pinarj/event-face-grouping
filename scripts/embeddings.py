@@ -289,8 +289,11 @@ def main():
     MAX_WORKERS = max(1, args.max_workers if args.max_workers else auto_workers)
     BATCH_SIZE = max(1, args.batch_size if args.batch_size else MAX_WORKERS * 2)
 
-    ctx_id = 0 if args.gpu else -1
-    device_label = f"GPU (ctx_id={ctx_id})" if args.gpu else "CPU"
+    import onnxruntime as ort
+    gpu_available = "CUDAExecutionProvider" in ort.get_available_providers()
+    use_gpu = args.gpu or gpu_available
+    ctx_id = 0 if use_gpu else -1
+    device_label = f"GPU (ctx_id={ctx_id})" if use_gpu else "CPU"
 
     if _IS_FORK:
         global APP_SHARED
