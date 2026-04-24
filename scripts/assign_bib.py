@@ -1,21 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-assign_bib.py — Assign bib numbers to face groups using QR/DataMatrix results.
-Optionally runs FAISS search to include candidate photos (pass_threshold: false).
+assign_bib.py — Assign bib numbers to face groups using QR or Brian's OCR output.
+Optionally runs FAISS search to find additional candidate photos.
 
-Logging: stderr only
-Output:  stdout — single JSON line on success
+Logging : stderr
+Output  : stdout — single JSON line
 
-Usage :
-    python assign_bib.py --groups refined_groups.json --qr qr.json \
-        --output output/ --embeddings embeddings/
+Usage (QR, no FAISS):
+    python assign_bib.py \
+        --groups refined_groups.json \
+        --qr qr.json \
+        --output output/
 
-    --embeddings is required for spatial face↔bib matching.
-    Without it, all faces in a multi-face photo receive the same bib vote
-    regardless of position, which can cause wrong bib assignments.
+Usage (QR + FAISS — includes low-similarity candidates with pass_threshold:false):
+    python assign_bib.py \
+        --groups refined_groups.json \
+        --qr qr.json \
+        --output output/ \
+        --faiss-dir faiss/ \
+        --embeddings embeddings/
 
+Usage (Brian OCR, no FAISS):
+    python assign_bib.py \
+        --groups refined_groups.json \
+        --ocr-json brian_output.json \
+        --output output/
+
+Usage (Brian OCR + FAISS):
+    python assign_bib.py \
+        --groups refined_groups.json \
+        --ocr-json brian_output.json \
+        --output output/ \
+        --faiss-dir faiss/ \
+        --embeddings embeddings/
 """
-
 
 import os
 import sys
@@ -71,7 +89,7 @@ def load_qr(qr_path):
             if not bib:
                 continue
             confidence = float(box.get("box_confidences", box.get("ocr_confidence", 0)))
-            xyxy = box.get("xyxy")  # bib bbox — used for spatial face↔bib matching
+            xyxy = box.get("xyxy")
             bib_lookup[filename].append((bib, confidence, xyxy))
 
     return bib_lookup
@@ -86,8 +104,11 @@ def _bbox_center(bbox):
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
 
+def _bbox_dist(c1, c2):
+    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5
+
+
 def _load_face_bbox(face_id, embeddings_dir):
-    """Return face [x1,y1,x2,y2] from _meta.json, or None."""
     if not embeddings_dir:
         return None
     meta_path = os.path.join(embeddings_dir, f"{face_id}_meta.json")
@@ -100,60 +121,43 @@ def _load_face_bbox(face_id, embeddings_dir):
         return None
 
 
-def _select_bib_for_face(face_bbox, bibs, min_confidence):
+def _select_bib_for_face(face_bbox, bibs_in_photo, min_confidence):
     """
-    Pick the best bib for a single face using spatial proximity.
-
-    For every photo (single or multiple bibs):
-    - If face bbox is known: find the closest bib whose center is within
-      3× the face diagonal. If closest bib is still too far, return None
-      (this face is not the owner of any detected bib in this photo).
-    - If face bbox is unknown: fall back to highest-confidence bib.
-
-    This prevents runners standing next to each other from inheriting
-    a neighbour's bib number even when only one bib is visible.
+    Pick the closest bib to a face within 3x face diagonal.
+    Falls back to highest-confidence bib if face bbox is unknown.
+    Prevents neighbouring runners from inheriting each other's bib.
     """
-    valid = [(bib, conf, xyxy) for bib, conf, xyxy in bibs if conf >= min_confidence]
+    valid = [(bib, conf, xyxy) for bib, conf, xyxy in bibs_in_photo if conf >= min_confidence]
     if not valid:
         return None, 0.0
 
     if face_bbox is not None:
-        fx, fy = _bbox_center(face_bbox)
+        face_cx, face_cy = _bbox_center(face_bbox)
         face_w = face_bbox[2] - face_bbox[0]
         face_h = face_bbox[3] - face_bbox[1]
         face_diag = (face_w ** 2 + face_h ** 2) ** 0.5
-        max_dist = face_diag * 3.0          # bib must be within 3× face diagonal
+        max_dist = face_diag * 3.0
 
         best_bib, best_conf, best_dist = None, 0.0, float("inf")
         for bib, conf, xyxy in valid:
             if xyxy is None:
                 continue
-            bx, by = _bbox_center(xyxy)
-            dist = ((fx - bx) ** 2 + (fy - by) ** 2) ** 0.5
+            dist = _bbox_dist((face_cx, face_cy), _bbox_center(xyxy))
             if dist < best_dist:
                 best_dist, best_bib, best_conf = dist, bib, conf
 
         if best_bib is not None:
-            # spatial data available — accept only if close enough
             if best_dist <= max_dist:
                 return best_bib, best_conf
             else:
-                return None, 0.0    # all bibs too far → not this face's bib
+                return None, 0.0
 
-    # no face bbox (or all bibs lack xyxy) → fallback: highest confidence
-    b, c, _ = max(valid, key=lambda x: x[1])
-    return b, c
+    best_bib, best_conf, _ = max(valid, key=lambda x: x[1])
+    return best_bib, best_conf
 
 
 def assign_bib_to_group(photos, bib_lookup, min_confidence=0.5, embeddings_dir=None):
-    """
-    Vote for the most common bib across all photos in the group.
-
-    Uses spatial proximity (face bbox vs bib bbox) for every photo,
-    regardless of how many bibs are detected in that photo. This ensures
-    that a runner standing next to the bib owner does not receive the
-    wrong bib number even when only one bib is visible in the photo.
-    """
+    """Vote for the most common bib across all photos in the group."""
     bib_scores = defaultdict(float)
     bib_best_conf = defaultdict(float)
 
@@ -209,19 +213,15 @@ def load_faiss_index(faiss_dir):
 def score_to_similarity(metric, raw):
     if metric in ("IP", "COSINE"):
         return (1.0 + float(raw)) / 2.0
-    # L2 squared distance
     return max(0.0, 1.0 - float(raw) / 4.0)
 
 
 def load_group_embedding(face_ids, embeddings_dir):
-    """Average embedding of all faces in the group."""
     embs = []
     for fid in face_ids:
-        # face_id may already include extension or not
         base = fid if fid.endswith(".npy") else fid + ".npy"
         path = os.path.join(embeddings_dir, base)
         if not os.path.isfile(path):
-            # try without extension suffix
             alt = os.path.join(embeddings_dir, os.path.splitext(fid)[0] + ".npy")
             if os.path.isfile(alt):
                 path = alt
@@ -245,10 +245,6 @@ def load_group_embedding(face_ids, embeddings_dir):
 
 def faiss_search_for_group(face_ids, embeddings_dir, index, filenames, metric,
                             threshold, candidate_threshold, top_k):
-    """
-    Search FAISS for a group.
-    Returns list of match dicts with pass_threshold True/False.
-    """
     emb = load_group_embedding(face_ids, embeddings_dir)
     if emb is None:
         return []
@@ -289,21 +285,62 @@ def faiss_search_for_group(face_ids, embeddings_dir, index, filenames, metric,
     return matches[:top_k]
 
 
+# ── Brian OCR ─────────────────────────────────────────────────────────────────
+
+def load_brian_ocr(ocr_path, status_filter=None):
+    with open(ocr_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict) or "groups" not in data:
+        raise ValueError(
+            "Not a Brian OCR output — expected top-level 'groups' key. "
+            "Use --qr for QR/DataMatrix JSON."
+        )
+
+    allowed = set(status_filter) if status_filter else {"confident"}
+    group_bib_map = {}
+
+    for group_id, gdata in data["groups"].items():
+        if not isinstance(gdata, dict):
+            continue
+        if gdata.get("status", "") not in allowed:
+            continue
+        bib = str(gdata.get("best_guess") or "").strip()
+        conf = float(gdata.get("confidence", 0.0))
+        if bib:
+            group_bib_map[group_id] = (bib, conf)
+
+    return group_bib_map
+
+
+def _is_brian_format(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False
+        groups = data.get("groups")
+        if not isinstance(groups, dict):
+            return False
+        sample = next(iter(groups.values()), None)
+        return isinstance(sample, dict) and "best_guess" in sample
+    except Exception:
+        return False
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     t0 = time.time()
     parser = argparse.ArgumentParser(description="Assign bib numbers to face groups")
     parser.add_argument("--groups",    required=True,  help="Path to refined_groups.json")
-    parser.add_argument("--qr",        required=True,  help="Path to qr.json")
+    parser.add_argument("--qr",        default=None,   help="Path to qr.json (QR/DataMatrix format)")
+    parser.add_argument("--ocr-json",  default=None,   help="Path to Brian's raceocr output.json")
     parser.add_argument("--output",    required=True,  help="Output folder")
     parser.add_argument("--min-confidence", type=float, default=0.5,
                         help="Min box_confidence to use a bib detection (default: 0.5)")
-    # embeddings folder — used for spatial bib matching AND FAISS search
     parser.add_argument("--embeddings",  default=None,
-                        help="Embeddings folder with .npy/_meta.json files "
-                             "(enables spatial face-bib matching; required with --faiss-dir)")
-    # FAISS (optional)
+                        help="Embeddings folder (required with --faiss-dir)")
     parser.add_argument("--faiss-dir",   default=None,
                         help="FAISS index folder (enables candidate photo search)")
     parser.add_argument("--threshold",   type=float, default=0.75,
@@ -312,12 +349,23 @@ def main():
                         help="Lower threshold for candidate photos (default: 0.65)")
     parser.add_argument("--top-k",  type=int, default=200,
                         help="Max FAISS results per bib (default: 200)")
+    parser.add_argument("--ocr-status", nargs="+", default=["confident"],
+                        help="Brian OCR statuses to accept (default: confident)")
     args = parser.parse_args()
+
+    if not args.qr and not args.ocr_json:
+        parser.error("one of --qr or --ocr-json is required")
+    if args.qr and args.ocr_json:
+        parser.error("--qr and --ocr-json are mutually exclusive")
+
+    if args.qr and _is_brian_format(args.qr):
+        logger.warning("Detected Brian's raceocr format in --qr; switching to --ocr-json mode.")
+        args.ocr_json = args.qr
+        args.qr = None
 
     json_dir = os.path.join(args.output, "json")
     os.makedirs(json_dir, exist_ok=True)
 
-    # load FAISS if requested
     faiss_index = faiss_filenames = faiss_metric = None
     use_faiss = bool(args.faiss_dir)
     if use_faiss:
@@ -336,37 +384,61 @@ def main():
         groups, noise = load_groups(args.groups)
         logger.info(f"Groups: {len(groups)}")
 
-        logger.info("Loading QR results...")
-        bib_lookup = load_qr(args.qr)
-        logger.info(f"Photos with bib detections: {len(bib_lookup)}")
-
         bib_matches  = defaultdict(list)
         bib_face_ids = defaultdict(list)
-        bib_seen     = defaultdict(set)   # dedup per bib across all groups
         assigned   = 0
         unassigned = 0
 
-        for group_id, photos in groups.items():
-            bib, confidence = assign_bib_to_group(photos, bib_lookup, args.min_confidence,
-                                                   embeddings_dir=args.embeddings)
-            if bib:
-                assigned += 1
-                bib_face_ids[bib].extend(photos)
-                if not use_faiss:
-                    for photo in photos:
-                        base = photo_to_base(photo)
-                        if base in bib_seen[bib]:
-                            continue
-                        bib_seen[bib].add(base)
-                        bib_matches[bib].append({
-                            "base":           base,
-                            "sim":            confidence,
-                            "pass_threshold": True,
-                        })
-            else:
-                unassigned += 1
+        if args.ocr_json:
+            logger.info("Loading Brian OCR results...")
+            group_bib_map = load_brian_ocr(args.ocr_json, status_filter=args.ocr_status)
+            logger.info(f"Groups with confident bib: {len(group_bib_map)}")
 
-        # FAISS search — build matches with pass_threshold True/False
+            for group_id, photos in groups.items():
+                entry = group_bib_map.get(group_id)
+                if entry:
+                    bib, confidence = entry
+                    assigned += 1
+                    bib_face_ids[bib].extend(photos)
+                    if not use_faiss:
+                        seen = {m["base"] for m in bib_matches[bib]}
+                        for photo in photos:
+                            base = photo_to_base(photo)
+                            if base not in seen:
+                                bib_matches[bib].append({
+                                    "base":           base,
+                                    "sim":            confidence,
+                                    "pass_threshold": True,
+                                })
+                                seen.add(base)
+                else:
+                    unassigned += 1
+
+        else:
+            logger.info("Loading QR results...")
+            bib_lookup = load_qr(args.qr)
+            logger.info(f"Photos with bib detections: {len(bib_lookup)}")
+
+            for group_id, photos in groups.items():
+                bib, confidence = assign_bib_to_group(photos, bib_lookup, args.min_confidence,
+                                                       embeddings_dir=args.embeddings)
+                if bib:
+                    assigned += 1
+                    bib_face_ids[bib].extend(photos)
+                    if not use_faiss:
+                        seen = {m["base"] for m in bib_matches[bib]}
+                        for photo in photos:
+                            base = photo_to_base(photo)
+                            if base not in seen:
+                                bib_matches[bib].append({
+                                    "base":           base,
+                                    "sim":            confidence,
+                                    "pass_threshold": True,
+                                })
+                                seen.add(base)
+                else:
+                    unassigned += 1
+
         if use_faiss:
             for bib, face_ids in bib_face_ids.items():
                 matches = faiss_search_for_group(
