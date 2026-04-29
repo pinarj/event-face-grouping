@@ -40,7 +40,9 @@ import argparse
 import numpy as np
 from datetime import datetime
 from PIL import Image, ExifTags, ImageEnhance
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import queue
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import cv2
 cv2.setNumThreads(1)
@@ -78,6 +80,8 @@ def parse_arguments():
                         help="Submit window size (default: 2 x workers)")
     parser.add_argument("--gpu", action="store_true",
                         help="Use GPU (CUDA) for inference — requires onnxruntime-gpu")
+    parser.add_argument("--io-threads", type=int, default=4,
+                        help="I/O + preprocessing threads for GPU pipeline (default: 4)")
     return parser.parse_args()
 
 
@@ -263,6 +267,129 @@ def _process_image_worker(input_folder, filename):
         return filename, None, f"Error: {str(e)}"
 
 
+def _preprocess_image(input_folder, filename):
+    """Load + EXIF + enhance. Returns (filename, img, error). img=None means skip (dark/error)."""
+    try:
+        img_path = os.path.join(input_folder, filename)
+        img = apply_exif_orientation(img_path)
+        if img is None:
+            return filename, None, f"Error: {filename} could not be loaded"
+        gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if gray_full.mean() < 30:
+            return filename, None, None  # too dark — not an error, just skip
+        return filename, img, None
+    except Exception as e:
+        return filename, None, f"Error: {str(e)}"
+
+
+def _run_inference(img):
+    """Run face detection + embedding extraction on a preprocessed image."""
+    faces = APP_SHARED.get(img)
+    if not faces:
+        enhanced_img = enhance_image(img)
+        faces = APP_SHARED.get(enhanced_img)
+    if not faces:
+        return []
+
+    out = []
+    for i, face in enumerate(faces):
+        emb = getattr(face, "embedding", None)
+        if emb is None:
+            continue
+        bbox = face.bbox.astype(int)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        if w < 40 or h < 40:
+            continue
+        score = float(getattr(face, "det_score", 1.0))
+        if score < 0.5:
+            continue
+        img_h, img_w = img.shape[:2]
+        x1r, y1r, x2r, y2r = bbox[0], bbox[1], bbox[2], bbox[3]
+        if x1r < 10 or y1r < 10 or x2r > img_w - 10 or y2r > img_h - 10:
+            continue
+        try:
+            x1, y1, x2, y2 = max(0, bbox[0]), max(0, bbox[1]), bbox[2], bbox[3]
+            crop = img[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            if cv2.Laplacian(gray, cv2.CV_64F).var() < 100:
+                continue
+            if gray.mean() < 40:
+                continue
+        except Exception:
+            continue
+        nrm = float(np.linalg.norm(emb))
+        if nrm == 0.0:
+            continue
+        out.append((i, (emb / nrm).astype(np.float32), bbox.tolist()))
+    return out
+
+
+def _run_gpu_pipeline(submit_list, input_folder, output_folder, num_io_threads=4):
+    """
+    Producer-consumer GPU pipeline:
+      - ThreadPoolExecutor (num_io_threads): I/O + preprocessing in parallel
+      - Main thread: GPU inference (single CUDA context, no contention)
+      - Save thread: file writes
+
+    Keeps GPU busy while CPU handles I/O concurrently.
+    """
+    preprocess_q = queue.Queue(maxsize=32)
+    save_q = queue.Queue(maxsize=32)
+    _DONE = object()
+
+    failed_files = []
+    total = len(submit_list)
+
+    def io_worker():
+        with ThreadPoolExecutor(max_workers=num_io_threads) as pool:
+            futures = {pool.submit(_preprocess_image, input_folder, f): f for f in submit_list}
+            for future in as_completed(futures):
+                preprocess_q.put(future.result())
+        preprocess_q.put(_DONE)
+
+    def save_worker():
+        while True:
+            item = save_q.get()
+            if item is _DONE:
+                break
+            filename, out = item
+            if out:
+                base = os.path.splitext(filename)[0]
+                for face_idx, embedding, bbox in out:
+                    uid = f"{base}_{face_idx}"
+                    np.save(os.path.join(output_folder, f"{uid}.npy"), embedding)
+                    with open(os.path.join(output_folder, f"{uid}_meta.json"), "w", encoding="utf-8") as f:
+                        json.dump({"original_filename": filename, "bbox": bbox}, f, ensure_ascii=False)
+
+    io_thread = threading.Thread(target=io_worker, daemon=True)
+    save_thread = threading.Thread(target=save_worker, daemon=True)
+    io_thread.start()
+    save_thread.start()
+
+    processed = 0
+    done = 0
+    while True:
+        item = preprocess_q.get()
+        if item is _DONE:
+            break
+        filename, img, error = item
+        if error:
+            failed_files.append((filename, error))
+            logger.error(error)
+        elif img is not None:
+            out = _run_inference(img)
+            save_q.put((filename, out))
+        processed += 1
+        done += 1
+        if done % 500 == 0 or done == total:
+            logger.info(f"Progress: {done}/{total} images processed")
+
+    save_q.put(_DONE)
+    save_thread.join()
+    io_thread.join()
+    return processed, failed_files
+
+
 def already_processed(output_folder, base_filename):
     pattern = os.path.join(output_folder, f"{base_filename}_*.npy")
     return any(glob.iglob(pattern))
@@ -286,16 +413,20 @@ def main():
     max_by_ram = max(1, int(total_ram_gb // 2))
     auto_workers = min(cpu_count, max_by_ram)
 
-    MAX_WORKERS = max(1, args.max_workers if args.max_workers else auto_workers)
-    BATCH_SIZE = max(1, args.batch_size if args.batch_size else MAX_WORKERS * 2)
-
     import onnxruntime as ort
     gpu_available = "CUDAExecutionProvider" in ort.get_available_providers()
     use_gpu = args.gpu or gpu_available
     ctx_id = 0 if use_gpu else -1
     device_label = f"GPU (ctx_id={ctx_id})" if use_gpu else "CPU"
 
-    if _IS_FORK:
+    if not use_gpu:
+        MAX_WORKERS = max(1, args.max_workers if args.max_workers else auto_workers)
+        BATCH_SIZE = max(1, args.batch_size if args.batch_size else MAX_WORKERS * 2)
+
+    if use_gpu or _IS_FORK:
+        # GPU pipeline always runs in main process (any OS) — load model here
+        # CPU fork mode (Linux) — load in parent, workers inherit via copy-on-write
+        # CPU spawn mode (Windows) — skipped here, each worker loads via _init_worker
         global APP_SHARED
         APP_SHARED = FaceAnalysis(name="buffalo_l")
         APP_SHARED.prepare(ctx_id=ctx_id, det_size=(640, 640), det_thresh=0.7)
@@ -377,31 +508,36 @@ def main():
         submit_list = image_files
 
     # run
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker, initargs=(ctx_id,)) as executor:
-        total_to_process = len(submit_list)
-        processed_count = 0
-        for chunk in chunks(submit_list, BATCH_SIZE):
-            futures = {executor.submit(_process_image_worker, INPUT_FOLDER, fname): fname for fname in chunk}
-            for future in as_completed(futures):
-                filename, embeddings, error = future.result()
-                base_filename = os.path.splitext(filename)[0]
+    if use_gpu:
+        processed, failed_files = _run_gpu_pipeline(
+            submit_list, INPUT_FOLDER, OUTPUT_FOLDER,
+            num_io_threads=args.io_threads
+        )
+    else:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_init_worker, initargs=(ctx_id,)) as executor:
+            total_to_process = len(submit_list)
+            processed_count = 0
+            for chunk in chunks(submit_list, BATCH_SIZE):
+                futures = {executor.submit(_process_image_worker, INPUT_FOLDER, fname): fname for fname in chunk}
+                for future in as_completed(futures):
+                    filename, embeddings, error = future.result()
+                    base_filename = os.path.splitext(filename)[0]
 
-                if error:
-                    logger.error(error)
-                    failed_files.append((filename, error))
-                else:
-                    if embeddings:
-                        for face_idx, embedding, bbox in embeddings:
-                            # each face gets its own .npy file and a meta.json with original filename + bbox
-                            unique_face_id = f"{base_filename}_{face_idx}"
-                            np.save(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}.npy"), embedding)
-                            with open(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}_meta.json"), "w", encoding="utf-8") as meta_file:
-                                json.dump({"original_filename": filename, "bbox": bbox}, meta_file, ensure_ascii=False)
+                    if error:
+                        logger.error(error)
+                        failed_files.append((filename, error))
+                    else:
+                        if embeddings:
+                            for face_idx, embedding, bbox in embeddings:
+                                unique_face_id = f"{base_filename}_{face_idx}"
+                                np.save(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}.npy"), embedding)
+                                with open(os.path.join(OUTPUT_FOLDER, f"{unique_face_id}_meta.json"), "w", encoding="utf-8") as meta_file:
+                                    json.dump({"original_filename": filename, "bbox": bbox}, meta_file, ensure_ascii=False)
 
-                processed += 1
-                processed_count += 1
-                if processed_count % 500 == 0 or processed_count == total_to_process:
-                    logger.info(f"Progress: {processed_count}/{total_to_process} images processed")
+                    processed += 1
+                    processed_count += 1
+                    if processed_count % 500 == 0 or processed_count == total_to_process:
+                        logger.info(f"Progress: {processed_count}/{total_to_process} images processed")
 
     # summary
     finished_at = datetime.now()
