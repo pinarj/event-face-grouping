@@ -328,43 +328,29 @@ def _run_gpu_pipeline(submit_list, input_folder, output_folder, num_io_threads=4
     """
     Producer-consumer GPU pipeline:
       - ThreadPoolExecutor (num_io_threads): I/O + preprocessing in parallel
-      - Main thread: GPU inference (single CUDA context, no contention)
-      - Save thread: file writes
+      - Main thread: GPU inference + save (single CUDA context, no contention)
 
-    Keeps GPU busy while CPU handles I/O concurrently.
+    Save happens directly in main loop to avoid queue deadlocks.
     """
-    preprocess_q = queue.Queue(maxsize=32)
-    save_q = queue.Queue(maxsize=32)
+    preprocess_q = queue.Queue(maxsize=64)
     _DONE = object()
 
     failed_files = []
     total = len(submit_list)
 
     def io_worker():
-        with ThreadPoolExecutor(max_workers=num_io_threads) as pool:
-            futures = {pool.submit(_preprocess_image, input_folder, f): f for f in submit_list}
-            for future in as_completed(futures):
-                preprocess_q.put(future.result())
-        preprocess_q.put(_DONE)
-
-    def save_worker():
-        while True:
-            item = save_q.get()
-            if item is _DONE:
-                break
-            filename, out = item
-            if out:
-                base = os.path.splitext(filename)[0]
-                for face_idx, embedding, bbox in out:
-                    uid = f"{base}_{face_idx}"
-                    np.save(os.path.join(output_folder, f"{uid}.npy"), embedding)
-                    with open(os.path.join(output_folder, f"{uid}_meta.json"), "w", encoding="utf-8") as f:
-                        json.dump({"original_filename": filename, "bbox": bbox}, f, ensure_ascii=False)
+        try:
+            with ThreadPoolExecutor(max_workers=num_io_threads) as pool:
+                futures = {pool.submit(_preprocess_image, input_folder, f): f for f in submit_list}
+                for future in as_completed(futures):
+                    preprocess_q.put(future.result())
+        except Exception as e:
+            logger.error(f"I/O thread error: {e}")
+        finally:
+            preprocess_q.put(_DONE)
 
     io_thread = threading.Thread(target=io_worker, daemon=True)
-    save_thread = threading.Thread(target=save_worker, daemon=True)
     io_thread.start()
-    save_thread.start()
 
     processed = 0
     done = 0
@@ -377,15 +363,23 @@ def _run_gpu_pipeline(submit_list, input_folder, output_folder, num_io_threads=4
             failed_files.append((filename, error))
             logger.error(error)
         elif img is not None:
-            out = _run_inference(img)
-            save_q.put((filename, out))
+            try:
+                out = _run_inference(img)
+                if out:
+                    base = os.path.splitext(filename)[0]
+                    for face_idx, embedding, bbox in out:
+                        uid = f"{base}_{face_idx}"
+                        np.save(os.path.join(output_folder, f"{uid}.npy"), embedding)
+                        with open(os.path.join(output_folder, f"{uid}_meta.json"), "w", encoding="utf-8") as f:
+                            json.dump({"original_filename": filename, "bbox": bbox}, f, ensure_ascii=False)
+            except Exception as e:
+                failed_files.append((filename, str(e)))
+                logger.error(f"Inference/save error {filename}: {e}")
         processed += 1
         done += 1
         if done % 500 == 0 or done == total:
             logger.info(f"Progress: {done}/{total} images processed")
 
-    save_q.put(_DONE)
-    save_thread.join()
     io_thread.join()
     return processed, failed_files
 
