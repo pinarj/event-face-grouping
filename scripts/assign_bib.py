@@ -239,8 +239,10 @@ def load_group_embedding(face_ids, embeddings_dir):
         return None
 
     avg = np.mean(embs, axis=0).astype("float32")
-    n = np.linalg.norm(avg)
-    return avg / n if n > 0 else None
+    best_idx = int(np.argmax([np.dot(e, avg) for e in embs]))
+    best = embs[best_idx]
+    n = np.linalg.norm(best)
+    return best / n if n > 0 else None
 
 
 def faiss_search_for_group(face_ids, embeddings_dir, index, filenames, metric,
